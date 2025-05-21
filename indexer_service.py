@@ -1,9 +1,3 @@
-# indexer_service.py
-# This script monitors specified data folders for changes (read from config.ini)
-# and performs incremental updates to the FAISS index using LangChain methods.
-# It tracks file modification times to trigger index rebuilds when changes are detected.
-# It runs as a standalone background service.
-
 import os
 import time
 import threading
@@ -15,6 +9,9 @@ import logging
 import traceback
 import json
 import uuid # Import the uuid module
+import argparse # NEW: For command-line argument parsing
+import shutil   # NEW: For deleting directories (shutil.rmtree)
+
 
 # --- watchdog imports ---
 from watchdog.observers import Observer
@@ -22,13 +19,14 @@ from watchdog.events import FileSystemEventHandler
 # ------------------------
 
 # LangChain/Ollama/FAISS imports
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import TextLoader
-from langchain_community.document_loaders import Docx2txtLoader
 from langchain_community.document_loaders import CSVLoader
-# from langchain_community.document_loaders import JSONLoader # Removed JSONLoader for now
-from langchain_community.document_loaders import UnstructuredExcelLoader # Added Excel Loader
-from langchain_community.document_loaders import UnstructuredPowerPointLoader # Added PowerPoint Loader
+from langchain_community.document_loaders import UnstructuredExcelLoader
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
+
+# NEW Unstructured specific loaders
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader
 
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -51,20 +49,30 @@ INDEX_READY_FILE = os.path.join(FAISS_PATH, "index_ready.timestamp") # File to s
 INDEX_STATE_FILE = os.path.join(FAISS_PATH, "indexed_files_state.json") # Track file mtimes
 
 
-# Ensure directories exist
+# Ensure directories exist (will be created or recreated by force-rebuild logic too)
 os.makedirs(FAISS_PATH, exist_ok=True)
 
 
-# --- Global variables ---
+# --- Global variables (will be populated from config.ini) ---
 embedding_function = None
 is_indexing = False # Flag to indicate if indexing is currently in progress
 MONITORED_PATHS = []
 indexed_files_state = {} # Tracks file_path: mtime
+
+# --- GLOBAL CONFIGURATIONS FOR CHUNKING/EXCLUSION (loaded from config.ini) ---
+SKIP_FIRST_N_PAGES = 0
+SKIP_LAST_N_PAGES = 0
+EXCLUDE_UNSTRUCTURED_CATEGORIES = []
+EXCLUDE_KEYWORDS_START = []
+EXCLUDE_KEYWORDS_END = []
+PAGES_TO_CHECK_START = 0
+PAGES_TO_CHECK_END = 0
 # ------------------------
 
 
 # --- Logging Setup ---
 # Configured in main execution block
+
 
 # --- State Management Functions ---
 
@@ -77,16 +85,16 @@ def load_index_state(state_file_path=INDEX_STATE_FILE):
         with open(state_file_path, 'r') as f:
             state = json.load(f)
             if not isinstance(state, dict):
-                 logging.error(f"Invalid state file format in {state_file_path}. Expected dictionary.")
-                 return {}
+                logging.error(f"Invalid state file format in {state_file_path}. Expected dictionary.")
+                return {}
             # Basic validation: ensure values are numbers (mtime)
             cleaned_state = {}
             for file_path, mtime in state.items():
-                 if isinstance(mtime, (int, float)):
-                      cleaned_state[file_path] = mtime
-                 else:
-                      logging.warning(f"Invalid mtime format for file {file_path} in {state_file_path}. Skipping entry.")
-                      continue
+                if isinstance(mtime, (int, float)):
+                    cleaned_state[file_path] = mtime
+                else:
+                    logging.warning(f"Invalid mtime format for file {file_path} in {state_file_path}. Skipping entry.")
+                    continue
             logging.info(f"Loaded index state from: {state_file_path} ({len(cleaned_state)} files tracked)")
             return cleaned_state
     except json.JSONDecodeError:
@@ -114,35 +122,54 @@ def save_index_state(state, state_file_path=INDEX_STATE_FILE):
 def load_document_with_path(file_path):
     """Loads a single document and returns it with its file path."""
     try:
-        # Use a simple case-insensitive check for file extensions
         file_extension = os.path.splitext(file_path)[1].lower()
+        loader = None
 
         if file_extension == ".pdf":
-            loader = PyPDFLoader(file_path)
+            logging.debug(f"Using UnstructuredPDFLoader for file: {file_path}")
+            loader = UnstructuredPDFLoader(file_path, mode="elements", strategy="fast")
+        elif file_extension == ".docx":
+            logging.debug(f"Using UnstructuredWordDocumentLoader for file: {file_path}")
+            loader = UnstructuredWordDocumentLoader(file_path, mode="elements")
         elif file_extension in (".md", ".txt"):
             loader = TextLoader(file_path)
-        elif file_extension == ".docx":
-            loader = Docx2txtLoader(file_path)
         elif file_extension == ".csv":
             loader = CSVLoader(file_path)
-        elif file_extension in (".xlsx", ".xls"): # Added Excel extensions
+        elif file_extension in (".xlsx", ".xls"):
             logging.debug(f"Using UnstructuredExcelLoader for file: {file_path}")
             loader = UnstructuredExcelLoader(file_path)
-        elif file_extension in (".pptx", ".ppt"): # Added PowerPoint extensions
+        elif file_extension in (".pptx", ".ppt"):
             logging.debug(f"Using UnstructuredPowerPointLoader for file: {file_path}")
             loader = UnstructuredPowerPointLoader(file_path)
-        # Add more loaders here for other formats
         else:
             logging.debug(f"Skipping unsupported file format: {file_path}")
-            return None # Return None for unsupported types
+            return None
 
         docs = loader.load()
-        # Add source metadata to each document
-        for doc in docs:
-            doc.metadata['source'] = os.path.abspath(file_path) # Add the original file path as source (use abspath for consistency)
-            # Optionally add mtime to metadata as well? doc.metadata['mtime'] = os.path.getmtime(file_path)
-        logging.debug(f"Loaded {len(docs)} pages/sections from {file_path}")
-        return docs
+        
+        processed_docs = []
+        for i, doc in enumerate(docs):
+            doc.metadata['source'] = os.path.abspath(file_path)
+            doc.metadata['filename'] = os.path.basename(file_path)
+            doc.metadata['chunk_id'] = str(uuid.uuid4()) # Unique ID for each initial document/page before splitting
+            
+            # Ensure a reliable page_number is set early for skipping
+            if 'page_number' in doc.metadata:
+                pass # Unstructured often provides this directly
+            elif 'page' in doc.metadata: # Fallback for other loaders
+                doc.metadata['page_number'] = doc.metadata['page'] + 1 
+            elif 'page_label' in doc.metadata:
+                 doc.metadata['page_number'] = doc.metadata['page_label'] # Keep label for non-numeric pages
+            else:
+                doc.metadata['page_number'] = i + 1 # Fallback to a sequential number
+
+            if 'category' in doc.metadata:
+                doc.metadata['element_category'] = doc.metadata['category']
+            
+            processed_docs.append(doc)
+
+        logging.debug(f"Loaded {len(processed_docs)} elements/pages from {file_path}")
+        return processed_docs
 
     except Exception as e:
         logging.error(f"Error loading file {file_path}: {e}", exc_info=True)
@@ -157,7 +184,7 @@ def get_current_files_state(paths_to_scan):
         logging.warning("No paths specified to scan.")
         return {}
 
-    supported_extensions = (".pdf", ".md", ".txt", ".docx", ".csv", ".xlsx", ".xls", ".pptx", ".ppt") # Added Excel and PowerPoint extensions
+    supported_extensions = (".pdf", ".md", ".txt", ".docx", ".csv", ".xlsx", ".xls", ".pptx", ".ppt")
 
     for data_path in paths_to_scan:
         if not os.path.exists(data_path):
@@ -169,10 +196,10 @@ def get_current_files_state(paths_to_scan):
                 file_path = os.path.join(root, file)
                 # Ignore directories and hidden files (basic check)
                 if not os.path.isfile(file_path) or file.startswith('.'):
-                     continue
+                    continue
                 # Check if the file extension is one we support
                 if not file_path.lower().endswith(supported_extensions):
-                     continue # Skip unsupported file types
+                    continue # Skip unsupported file types
 
                 try:
                     mtime = os.path.getmtime(os.path.abspath(file_path)) # Use abspath for consistency
@@ -184,17 +211,103 @@ def get_current_files_state(paths_to_scan):
     return current_state
 
 
-# Original split_documents function - no changes needed
-def split_documents(documents):
-    """Splits documents into smaller chunks."""
+# --- MODIFIED split_documents function ---
+def split_documents(documents: list[Document]) -> list[Document]:
+    """
+    Splits documents into smaller chunks, applying exclusion rules for
+    TOC, glossary, and similar sections, especially at document start/end.
+    """
+    
+    # Access global configuration variables directly as they are module-level
+    # No 'global' keyword needed here because we are only reading them, not re-assigning them in this function.
+    
+    if not documents:
+        logging.warning("No documents provided to split_documents.")
+        return []
+
+    logging.info(f"Applying document exclusion rules to {len(documents)} elements...")
+    
+    # Identify unique numeric page numbers for range checks
+    # This helps in accurately determining min/max page numbers even if page numbering is not sequential
+    numeric_page_numbers = sorted(list(set(
+        doc.metadata.get('page_number') for doc in documents 
+        if isinstance(doc.metadata.get('page_number'), (int, float))
+    )))
+    
+    min_page_num = numeric_page_numbers[0] if numeric_page_numbers else 1
+    max_page_num = numeric_page_numbers[-1] if numeric_page_numbers else 1
+    
+    # Filtered list to hold documents that pass exclusion
+    filtered_for_splitting = []
+
+    for idx, doc in enumerate(documents):
+        doc_content_lower = doc.page_content.strip().lower()
+        doc_page_number = doc.metadata.get('page_number') # Can be int, float, or string (e.g., 'A-1')
+        doc_element_category = doc.metadata.get('element_category', '').lower()
+
+        # Rule 1: Manual element/page skip (absolute index in the `documents` list)
+        # This is simple and effective for 'first X elements/pages' and 'last Y elements/pages'
+        if SKIP_FIRST_N_PAGES > 0 and idx < SKIP_FIRST_N_PAGES:
+            logging.debug(f"Skipping document (Manual start skip: {idx}/{len(documents)}) from {doc.metadata.get('filename')} (Page {doc_page_number})")
+            continue
+        if SKIP_LAST_N_PAGES > 0 and idx >= len(documents) - SKIP_LAST_N_PAGES:
+            logging.debug(f"Skipping document (Manual end skip: {idx}/{len(documents)}) from {doc.metadata.get('filename')} (Page {doc_page_number})")
+            continue
+
+        # Rule 2: Exclude by Unstructured.io element category
+        if doc_element_category in EXCLUDE_UNSTRUCTURED_CATEGORIES:
+            logging.debug(f"Skipping document (Category: {doc.metadata.get('element_category')}) from {doc.metadata.get('filename')} (Page {doc_page_number})")
+            continue
+
+        # Rule 3: Keyword-based exclusion (with position awareness)
+        # This applies if page_number is numeric and within the specified ranges
+        is_in_start_check_range = False
+        if isinstance(doc_page_number, (int, float)) and PAGES_TO_CHECK_START > 0 and doc_page_number <= min_page_num + PAGES_TO_CHECK_START -1:
+            is_in_start_check_range = True
+
+        is_in_end_check_range = False
+        if isinstance(doc_page_number, (int, float)) and PAGES_TO_CHECK_END > 0 and doc_page_number >= max_page_num - PAGES_TO_CHECK_END + 1:
+            is_in_end_check_range = True
+        
+        # Check against keywords for start-of-document sections
+        if is_in_start_check_range:
+            for keyword in EXCLUDE_KEYWORDS_START:
+                if keyword in doc_content_lower:
+                    logging.info(f"Skipping document (Keyword '{keyword}' in start pages): {doc.metadata.get('filename')} (Page {doc_page_number})")
+                    break # Found a match, skip this document
+            else: # No keyword found, add to processing list
+                filtered_for_splitting.append(doc)
+            continue # Move to next document
+
+        # Check against keywords for end-of-document sections
+        if is_in_end_check_range:
+            for keyword in EXCLUDE_KEYWORDS_END:
+                if keyword in doc_content_lower:
+                    logging.info(f"Skipping document (Keyword '{keyword}' in end pages): {doc.metadata.get('filename')} (Page {doc_page_number})")
+                    break # Found a match, skip this document
+            else: # No keyword found, add to processing list
+                filtered_for_splitting.append(doc)
+            continue # Move to next document
+        
+        # If no exclusion rule was met, add the document
+        filtered_for_splitting.append(doc)
+
+    logging.info(f"Filtered down to {len(filtered_for_splitting)} documents for chunking after exclusion rules.")
+
+    # Apply RecursiveCharacterTextSplitter to the filtered documents
+    if not filtered_for_splitting:
+        logging.warning("No documents remaining after exclusion for splitting.")
+        return []
+
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
         length_function=len,
         is_separator_regex=False,
+        separators=["\n\n", "\n", " ", ""] # Good default for Unstructured output
     )
-    all_splits = text_splitter.split_documents(documents)
-    logging.info(f"Split into {len(all_splits)} chunks")
+    all_splits = text_splitter.split_documents(filtered_for_splitting)
+    logging.info(f"Split into {len(all_splits)} chunks after text splitting.")
     return all_splits
 
 # Original get_embedding_function - no changes needed
@@ -233,8 +346,8 @@ def update_index_incrementally():
              logging.warning("Embedding function not initialized! Attempting to initialize now...")
              embedding_function = get_embedding_function()
              if embedding_function is None:
-                  logging.error("Embedding function failed to initialize. Cannot proceed with indexing.")
-                  return # Exit if embeddings are not available
+                 logging.error("Embedding function failed to initialize. Cannot proceed with indexing.")
+                 return # Exit if embeddings are not available
 
 
         last_indexed_state = indexed_files_state.copy()
@@ -244,16 +357,17 @@ def update_index_incrementally():
 
         # Determine if any files have been added, deleted, or modified
         if set(last_indexed_state.keys()) != set(current_files_state.keys()):
-             files_changed = True
-             logging.info("File list has changed (added or deleted files).")
+            files_changed = True
+            logging.info("File list has changed (added or deleted files).")
         else:
-             for file_path, current_mtime in current_files_state.items():
-                  if last_indexed_state.get(file_path) != current_mtime:
-                       files_changed = True
-                       logging.info(f"File modified: {file_path}")
-                       break # Found a modified file, no need to check others
+            for file_path, current_mtime in current_files_state.items():
+                if last_indexed_state.get(file_path) != current_mtime:
+                     files_changed = True
+                     logging.info(f"File modified: {file_path}")
+                     break # Found a modified file, no need to check others
 
-        if files_changed or not last_indexed_state: # Rebuild if changes or if starting with empty state
+        # Rebuild if changes or if starting with empty state (which happens on --force-rebuild)
+        if files_changed or not last_indexed_state: 
             logging.info("Changes detected or starting fresh. Rebuilding FAISS index from all current files...")
 
             all_chunks_to_index = []
@@ -261,16 +375,16 @@ def update_index_incrementally():
 
             # Load and split all current documents
             for file_path, current_mtime in current_files_state.items():
-                 docs = load_document_with_path(file_path)
-                 if docs:
-                     chunks = split_documents(docs)
-                     if chunks:
-                         all_chunks_to_index.extend(chunks)
-                         new_indexed_files_state[file_path] = current_mtime
-                     else:
-                         logging.warning(f"No chunks generated for file: {file_path}")
-                 else:
-                      logging.warning(f"No documents loaded for file: {file_path}")
+                docs = load_document_with_path(file_path)
+                if docs:
+                    chunks = split_documents(docs) # This is where the new filtering logic is
+                    if chunks:
+                        all_chunks_to_index.extend(chunks)
+                        new_indexed_files_state[file_path] = current_mtime
+                    else:
+                        logging.warning(f"No chunks generated for file: {file_path} after exclusion.")
+                else:
+                     logging.warning(f"No documents loaded for file: {file_path}.")
 
 
             if all_chunks_to_index:
@@ -293,27 +407,26 @@ def update_index_incrementally():
                      signal_index_ready()
 
                  except Exception as e:
-                      logging.error(f"Error creating/rebuilding FAISS index: {e}", exc_info=True)
-                      logging.warning("FAISS index rebuild failed. Index state NOT saved.")
-                      # Decide how to handle indexing errors - for now, log and continue
+                     logging.error(f"Error creating/rebuilding FAISS index: {e}", exc_info=True)
+                     logging.warning("FAISS index rebuild failed. Index state NOT saved.")
 
 
             else:
                  logging.warning("No documents found or processed to build the FAISS index.")
                  # If no documents are found but there was a previous state, clear the index files and state
                  if last_indexed_state:
-                      logging.info("Clearing old FAISS index files and state as no documents are present.")
-                      try:
-                           if os.path.exists(FAISS_PATH):
-                                for item in os.listdir(FAISS_PATH):
-                                     item_path = os.path.join(FAISS_PATH, item)
-                                     if os.path.isfile(item_path):
-                                          os.remove(item_path)
-                           indexed_files_state = {}
-                           save_index_state(indexed_files_state)
-                           signal_index_ready() # Signal readiness even if empty
-                      except Exception as e:
-                           logging.error(f"Error clearing FAISS index files: {e}", exc_info=True)
+                     logging.info("Clearing old FAISS index files and state as no documents are present.")
+                     try:
+                         if os.path.exists(FAISS_PATH):
+                             for item in os.listdir(FAISS_PATH):
+                                 item_path = os.path.join(FAISS_PATH, item)
+                                 if os.path.isfile(item_path): # Only remove files, not directories
+                                     os.remove(item_path)
+                         indexed_files_state = {}
+                         save_index_state(indexed_files_state)
+                         signal_index_ready() # Signal readiness even if empty
+                     except Exception as e:
+                         logging.error(f"Error clearing FAISS index files: {e}", exc_info=True)
 
 
         else:
@@ -377,17 +490,17 @@ class DocumentEventHandler(FileSystemEventHandler):
     def on_any_event(self, event):
         if event.is_directory:
              if event.event_type == 'created':
-                  is_within_monitored_path = False
-                  for monitored_path in self.monitored_paths:
-                       if os.path.abspath(event.src_path).startswith(monitored_path):
-                            is_within_monitored_path = True
-                            break
-                  if not is_within_monitored_path:
-                       logging.debug(f"WATCHDOG: Ignoring directory creation outside monitored paths: {event.src_path}")
-                       return
-                  pass
+                 is_within_monitored_path = False
+                 for monitored_path in self.monitored_paths:
+                      if os.path.abspath(event.src_path).startswith(monitored_path):
+                          is_within_monitored_path = True
+                          break
+                 if not is_within_monitored_path:
+                      logging.debug(f"WATCHDOG: Ignoring directory creation outside monitored paths: {event.src_path}")
+                      return
+                 pass
              else:
-                  if not (event.event_type == 'moved' and hasattr(event, 'dest_path') and os.path.abspath(event.dest_path).startswith(self.monitored_paths[0] if self.monitored_paths else '')) :
+                  if not (event.event_type == 'moved' and hasattr(event, 'dest_path') and os.path.abspath(event.dest_path).startswith(self.monitored_paths[0] if self.monitored_paths else '') ):
                        logging.debug(f"WATCHDOG: Ignoring non-creation directory event: {event.event_type} on {event.src_path}")
                        return
 
@@ -509,12 +622,17 @@ def signal_index_ready():
 if __name__ == "__main__":
     print(f"Indexer Service starting from: {os.getcwd()}")
 
-    config_file = DEFAULT_CONFIG_FILE
-    if len(sys.argv) > 1:
-         if sys.argv[1].lower().endswith(".ini"):
-              config_file = sys.argv[1]
-         else:
-              print(f"Warning: Ignoring unexpected command line argument: {sys.argv[1]}")
+    # --- NEW: Argument Parsing ---
+    parser = argparse.ArgumentParser(description="Run the RAG Indexer Service.")
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_FILE,
+                        help=f"Path to the configuration file (default: {DEFAULT_CONFIG_FILE})")
+    parser.add_argument('--force-rebuild', action='store_true',
+                        help="Force a complete rebuild of the FAISS index from scratch.")
+    args = parser.parse_args()
+
+    config_file = args.config
+    force_rebuild_flag = args.force_rebuild
+    # --- END NEW Argument Parsing ---
 
     config = load_config(config_file)
 
@@ -527,6 +645,61 @@ if __name__ == "__main__":
     logging.info(f"Indexer Service running from: {os.getcwd()}")
 
     try:
+        # These variables are already global as they are defined at the module level.
+        # Direct assignments in this top-level script block will modify them.
+        # No 'global' keyword is needed here, and indeed, adding it causes a SyntaxError.
+        #global indexed_files_state
+        SKIP_FIRST_N_PAGES = config.getint('Indexer', 'skip_first_n_pages', fallback=0)
+        SKIP_LAST_N_PAGES = config.getint('Indexer', 'skip_last_n_pages', fallback=0)
+        
+        exclude_categories_str = config.get('Indexer', 'exclude_unstructured_categories', fallback='')
+        EXCLUDE_UNSTRUCTURED_CATEGORIES = [c.strip().lower() for c in exclude_categories_str.split(',') if c.strip()]
+        
+        exclude_keywords_start_str = config.get('Indexer', 'exclude_keywords_start', fallback='')
+        EXCLUDE_KEYWORDS_START = [k.strip().lower() for k in exclude_keywords_start_str.split(',') if k.strip()]
+        
+        exclude_keywords_end_str = config.get('Indexer', 'exclude_keywords_end', fallback='')
+        EXCLUDE_KEYWORDS_END = [k.strip().lower() for k in exclude_keywords_end_str.split(',') if k.strip()]
+        
+        PAGES_TO_CHECK_START = config.getint('Indexer', 'pages_to_check_start', fallback=0)
+        PAGES_TO_CHECK_END = config.getint('Indexer', 'pages_to_check_end', fallback=0)
+
+        logging.info(f"Chunking/Exclusion Configured: "
+                     f"Manual Skip (Start: {SKIP_FIRST_N_PAGES}, End: {SKIP_LAST_N_PAGES}); "
+                     f"Exclude Categories: {EXCLUDE_UNSTRUCTURED_CATEGORIES}; "
+                     f"Keyword Check Pages (Start: {PAGES_TO_CHECK_START}, End: {PAGES_TO_CHECK_END}); "
+                     f"Keywords (Start: {EXCLUDE_KEYWORDS_START[:3]}..., End: {EXCLUDE_KEYWORDS_END[:3]}...)")
+        
+        # --- NEW: Handle force rebuild flag ---
+        if force_rebuild_flag:
+            logging.info("FORCE REBUILD requested: Clearing existing index state and deleting FAISS directory.")
+            
+            # Clear the in-memory state variable (global)
+            # We use `global indexed_files_state` here because `indexed_files_state`
+            # is a complex object (dict) that is modified and assigned directly in this block.
+            # While simple assignments to module-level variables don't need `global` in __main__,
+            # explicitly declaring it for a mutable object like `indexed_files_state`
+            # when re-assigning it entirely (e.g., `indexed_files_state = {}`) is safer
+            # and avoids potential confusion for the interpreter.
+            
+            indexed_files_state = {}
+
+            # Delete the persisted state file as well
+            if os.path.exists(INDEX_STATE_FILE):
+                os.remove(INDEX_STATE_FILE)
+                logging.info(f"Deleted index state file: {INDEX_STATE_FILE}")
+            
+            # Delete the entire FAISS index directory for a truly clean rebuild
+            if os.path.exists(FAISS_PATH):
+                shutil.rmtree(FAISS_PATH)
+                logging.info(f"Deleted existing FAISS index directory: {FAISS_PATH}")
+            
+            # Ensure the FAISS_PATH directory is re-created for the new index
+            os.makedirs(FAISS_PATH, exist_ok=True)
+            logging.info(f"Re-created empty FAISS directory: {FAISS_PATH}")
+        # --- END NEW: Handle force rebuild flag ---
+
+
         MONITORED_PATHS = get_monitored_paths_from_config(config)
 
         if not MONITORED_PATHS:
@@ -535,9 +708,9 @@ if __name__ == "__main__":
 
         embedding_function = get_embedding_function(EMBEDDING_MODEL_NAME)
 
-        # Load initial state and perform initial index update (rebuild)
+        # Load initial state (this will be empty if --force-rebuild was used due to clearing it)
         indexed_files_state = load_index_state()
-        update_index_incrementally() # Perform initial index build/rebuild
+        update_index_incrementally() # This will now trigger a full rebuild if indexed_files_state is empty
 
 
         logging.info(f"\n--- Starting watchdog observer for {MONITORED_PATHS} ---")

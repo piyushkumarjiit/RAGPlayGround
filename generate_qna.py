@@ -4,8 +4,9 @@ import time
 import requests
 import logging
 import re # Import the re module for regular expressions
+import argparse # Import argparse for command-line arguments
 
-# Import necessary loaders from langchain
+# Import necessary loaders and classes from langchain
 # You will need to install these:
 # pip install langchain langchain-community pypdf docx2txt unstructured openpyxl python-pptx
 from langchain_community.document_loaders import (
@@ -13,16 +14,28 @@ from langchain_community.document_loaders import (
     TextLoader,
     Docx2txtLoader,
     CSVLoader,
-    UnstructuredExcelLoader, # Note: Requires 'unstructured' and 'openpyxl'
-    UnstructuredPowerPointLoader, # Note: Requires 'unstructured' and 'python-pptx'
+    UnstructuredExcelLoader,
+    UnstructuredPowerPointLoader,
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.docstore.document import Document # Import Document class for type hinting
+from langchain.text_splitter import RecursiveCharacterTextSplitter # Ensure this is imported
+from langchain.docstore.document import Document # Ensure this is imported
 
 # --- Logging Configuration ---
 # Set level to DEBUG to see all detailed messages, including raw LLM output
 # Set to INFO for less verbose output once debugging is complete
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging to a file and console
+log_file_path = "qna_generation.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path, mode='w', encoding='utf-8'), # Log to file, overwrite each run
+        logging.StreamHandler() # Log to console
+    ]
+)
+logging.getLogger('httpx').setLevel(logging.WARNING) # Suppress noisy http client logs
+logging.getLogger('httpcore').setLevel(logging.WARNING) # Suppress noisy http client logs
+
 
 # --- Configuration ---
 OLLAMA_API_URL = "http://localhost:11434/api/generate" # Default Ollama API endpoint
@@ -30,6 +43,7 @@ QWEN_MODEL_NAME = "qwen3:8b" # Updated to your specific model
 DOCUMENTS_DIR = "data" # Directory where your source documents are located
 OUTPUT_DIR = "generated_qna_data" # Directory to save generated Q&A JSON files
 PAGES_TO_SKIP_AT_START = 10 # Number of initial pages to skip for PDF documents
+PAGES_TO_SKIP_AT_END = 0 # Number of pages to skip from the end for PDF documents
 
 # --- Chunking Parameters (tuned for Q&A generation) ---
 CHUNK_SIZE = 500
@@ -72,10 +86,11 @@ def clean_text(text: str) -> str:
 
 
 # --- Document Loading (adapted from your indexer_service.py) ---
-def load_document_with_path(file_path: str) -> list[Document] | None:
+def load_document_with_path(file_path: str, skip_start_pages: int, skip_end_pages: int) -> list:
     """
-    Loads a single document, concatenates its page content (if multi-page),
-    cleans the text, and returns it as a single Langchain Document object.
+    Loads a single document, applies page skipping from start and end (for PDFs),
+    concatenates its page content (if multi-page), cleans the text, and returns it
+    as a single Langchain Document object.
     This effectively removes internal 'page breaks' by merging all content.
     """
     logging.info(f"Attempting to load file: {file_path}")
@@ -86,14 +101,26 @@ def load_document_with_path(file_path: str) -> list[Document] | None:
         if file_extension == ".pdf":
             loader = PyPDFLoader(file_path)
             all_pages = loader.load()
+            total_pages = len(all_pages)
             
-            # Apply page skipping for PDF documents
-            if len(all_pages) > PAGES_TO_SKIP_AT_START:
-                raw_docs = all_pages[PAGES_TO_SKIP_AT_START:]
-                logging.info(f"Skipped first {PAGES_TO_SKIP_AT_START} pages for PDF: {file_path}")
+            logging.info(f"PDF document {file_path} has {total_pages} pages.")
+
+            # Apply page skipping from the start
+            if skip_start_pages > 0 and total_pages > skip_start_pages:
+                raw_docs = all_pages[skip_start_pages:]
+                logging.info(f"Skipped first {skip_start_pages} pages for PDF: {file_path}. Remaining pages: {len(raw_docs)}")
             else:
                 raw_docs = all_pages
-                logging.info(f"Document {file_path} has {len(all_pages)} pages, no pages skipped (less than or equal to {PAGES_TO_SKIP_AT_START}).")
+                if skip_start_pages > 0: # Only log if user tried to skip
+                    logging.info(f"Document {file_path} has {total_pages} pages, less than or equal to {skip_start_pages} pages. No pages skipped from start.")
+            
+            # Apply page skipping from the end to the *remaining* pages
+            if skip_end_pages > 0 and len(raw_docs) > skip_end_pages:
+                raw_docs = raw_docs[:-skip_end_pages]
+                logging.info(f"Skipped last {skip_end_pages} pages for PDF: {file_path}. Remaining pages: {len(raw_docs)}")
+            elif skip_end_pages > 0: # Only log if user tried to skip
+                logging.info(f"After skipping start pages, document {file_path} has {len(raw_docs)} pages, less than or equal to {skip_end_pages} pages. No pages skipped from end.")
+            
         elif file_extension in (".md", ".txt"):
             loader = TextLoader(file_path)
             raw_docs = loader.load()
@@ -210,20 +237,35 @@ JSON Output:
 """
 
 # --- Main Generation Logic ---
-def generate_qna_for_document(doc_path: str):
+def generate_qna_for_document(doc_path: str, overwrite_flag: bool = False, skip_start: int = 0, skip_end: int = 0) -> dict:
+    """
+    Generates Q&A pairs for a single document.
+    Returns a dictionary with generation status (processed, skipped, failed, qna_count).
+    """
     logging.info(f"Processing document: {doc_path}")
     
-    # load_document_with_path now returns a list containing a single, consolidated Document
-    consolidated_docs = load_document_with_path(doc_path)
+    # --- MODIFIED: Generate unique filename using os.path.splitext ---
+    # This will take the full filename before the last dot (extension), ensuring more uniqueness
+    doc_file_name_base = os.path.splitext(os.path.basename(doc_path))[0]
+    # --- END MODIFIED ---
+
+    output_file_path = os.path.join(OUTPUT_DIR, f"{doc_file_name_base}_generated_qna.json")
+
+    # Check if Q&A file already exists and overwrite_flag is False
+    if os.path.exists(output_file_path) and not overwrite_flag:
+        logging.info(f"Q&A file already exists for {doc_file_name_base} at {output_file_path}. Skipping generation. Use --overwrite to regenerate.")
+        return {"status": "skipped", "reason": "exists", "qna_count": 0}
+
+    # Pass skip_start_pages and skip_end_pages to load_document_with_path
+    consolidated_docs = load_document_with_path(doc_path, skip_start_pages=skip_start, skip_end_pages=skip_end)
     if not consolidated_docs: 
-        logging.warning(f"No content to process for {doc_path}. Skipping Q&A generation.")
-        return
+        logging.warning(f"No content to process for {doc_path} after skipping pages. Skipping Q&A generation.")
+        return {"status": "skipped", "reason": "no_content_after_skip", "qna_count": 0}
 
     # The text splitter will now operate on this single, long document
     chunks = text_splitter_for_qna.split_documents(consolidated_docs)
     
     all_qna_data = []
-    doc_file_name_base = os.path.basename(doc_path).split('.')[0] 
 
     for i, chunk_doc in enumerate(chunks):
         chunk_text = chunk_doc.page_content # This content is already cleaned and potentially concatenated
@@ -349,30 +391,80 @@ def generate_qna_for_document(doc_path: str):
 
         except requests.exceptions.RequestException as req_err:
             logging.error(f"    Network or API error for chunk {i+1}: {req_err}")
+            return {"status": "failed", "reason": f"API Error: {req_err}", "qna_count": 0}
         except Exception as e: # Catch any other unexpected errors
             logging.error(f"    An unexpected error occurred for chunk {i+1}: {e}", exc_info=True)
+            return {"status": "failed", "reason": f"Unexpected error: {e}", "qna_count": 0}
         
         time.sleep(0.5) # Add a small delay to avoid overwhelming Ollama
 
     if all_qna_data: # Only save if we actually generated some Q&A
-        output_file_path = os.path.join(OUTPUT_DIR, f"{doc_file_name_base}_generated_qna.json")
         with open(output_file_path, 'w', encoding='utf-8') as f:
             json.dump(all_qna_data, f, indent=2)
         logging.info(f"Finished {doc_file_name_base}. Total Q&A pairs: {len(all_qna_data)}. Saved to {output_file_path}\n")
+        return {"status": "processed", "reason": "success", "qna_count": len(all_qna_data)}
     else:
         logging.warning(f"No Q&A pairs generated for {doc_file_name_base}. Output file not created.\n")
+        return {"status": "failed", "reason": "no_qna_generated", "qna_count": 0}
 
 # --- Main execution block ---
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate Q&A pairs from documents using Ollama.")
+    parser.add_argument("--overwrite", action="store_true", 
+                        help="Set this flag to regenerate Q&A files even if they already exist.")
+    parser.add_argument("--skip-start-pages", type=int, default=PAGES_TO_SKIP_AT_START,
+                        help=f"Number of pages to skip from the beginning of PDF documents (default: {PAGES_TO_SKIP_AT_START}).")
+    parser.add_argument("--skip-end-pages", type=int, default=PAGES_TO_SKIP_AT_END,
+                        help=f"Number of pages to skip from the end of PDF documents (default: {PAGES_TO_SKIP_AT_END}).")
+    args = parser.parse_args()
+
+    logging.info("Starting Q&A generation script.")
+    start_time = time.time()
+
     monitored_paths = [DOCUMENTS_DIR]
     current_files = get_current_files_state(monitored_paths)
     
+    total_files_scanned = len(current_files)
+    files_processed_successfully = 0
+    files_skipped_exist = 0
+    files_skipped_no_content_after_skip = 0
+    files_failed = 0
+    total_qna_generated = 0
+
     if not current_files:
         logging.warning(f"No supported documents found in '{DOCUMENTS_DIR}'. Please ensure files are in the directory and supported types.")
 
     for file_path in current_files.keys():
-        generate_qna_for_document(file_path)
+        result = generate_qna_for_document(
+            file_path,
+            overwrite_flag=args.overwrite,
+            skip_start=args.skip_start_pages,
+            skip_end=args.skip_end_pages
+        )
+        
+        if result["status"] == "processed":
+            files_processed_successfully += 1
+            total_qna_generated += result["qna_count"]
+        elif result["status"] == "skipped":
+            if result["reason"] == "exists":
+                files_skipped_exist += 1
+            elif result["reason"] == "no_content_after_skip":
+                files_skipped_no_content_after_skip += 1
+        elif result["status"] == "failed":
+            files_failed += 1
+    
+    end_time = time.time()
+    duration = end_time - start_time
 
+    logging.info("\n--- Q&A Generation Summary ---")
+    logging.info(f"Total files scanned: {total_files_scanned}")
+    logging.info(f"Files processed successfully: {files_processed_successfully}")
+    logging.info(f"Files skipped (already exist): {files_skipped_exist}")
+    logging.info(f"Files skipped (no content after page trimming/unsupported format): {files_skipped_no_content_after_skip}")
+    logging.info(f"Files failed during processing: {files_failed}")
+    logging.info(f"Total Q&A pairs generated: {total_qna_generated}")
+    logging.info(f"Total execution time: {duration:.2f} seconds")
+    logging.info(f"Detailed logs available in: {log_file_path}")
     logging.info("Q&A generation complete for all processed documents.")
     logging.info(f"Please review the generated JSON files in the '{OUTPUT_DIR}' directory.")
     logging.info("Manual review is crucial to ensure quality and correctness of generated Q&A.")
